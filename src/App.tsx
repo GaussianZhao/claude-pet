@@ -11,11 +11,23 @@ const BASE_H = 150;
 const CLOSED_W = 150;
 const OPEN_W = 280;
 
+// Where the pet and the card sit inside the window (logical px, from top-left).
+// The backend computes this so the pet stays put on screen while the card
+// shifts to stay fully on-monitor near an edge/corner.
+type Layout = {
+  petLeft: number;
+  petBottom: number;
+  panelLeft: number;
+  panelTop: number;
+};
+const CLOSED_LAYOUT: Layout = { petLeft: 0, petBottom: 0, panelLeft: 0, panelTop: 0 };
+
 export default function App() {
   const state = useClaudeState();
   const [open, setOpen] = useState(false);
   const panelRef = useRef<HTMLDivElement>(null);
   const [panelH, setPanelH] = useState(0);
+  const [layout, setLayout] = useState<Layout>(CLOSED_LAYOUT);
   const prevOpen = useRef(false);
 
   // Ask for notification permission once.
@@ -36,8 +48,9 @@ export default function App() {
     }
   }, [open, state.sessions]);
 
-  // Grow the window upward to fit the panel (or shrink when closed). The pet
-  // stays put because resize_window keeps the bottom edge fixed.
+  // Resize/position the window to fit the card (or shrink when closed). The pet
+  // keeps its screen position; the backend returns where to place the pet and
+  // card inside the (possibly shifted) window.
   useEffect(() => {
     if (!isTauri) return;
     // Capture the anchor only on the open transition; reuse it for panel-size
@@ -46,22 +59,33 @@ export default function App() {
     prevOpen.current = open;
     (async () => {
       const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("resize_window", {
-        width: open ? OPEN_W : CLOSED_W,
-        height: open ? BASE_H + panelH : BASE_H,
+      const next = await invoke<Layout>("resize_window", {
+        open,
+        panelH,
+        closedW: CLOSED_W,
+        openW: OPEN_W,
+        baseH: BASE_H,
         anchor: justOpened,
       });
+      setLayout(open ? next : CLOSED_LAYOUT);
     })();
   }, [open, panelH]);
 
   return (
     <div className="app">
       {open && (
-        <div className="panel-wrap" ref={panelRef}>
+        <div
+          className="panel-wrap"
+          ref={panelRef}
+          style={{ left: layout.panelLeft, top: layout.panelTop, width: OPEN_W }}
+        >
           <StatusPanel sessions={state.sessions} />
         </div>
       )}
-      <div className="pet-anchor">
+      <div
+        className="pet-anchor"
+        style={{ left: layout.petLeft, bottom: layout.petBottom }}
+      >
         <Pet state={state} onClick={() => setOpen((v) => !v)} />
       </div>
     </div>

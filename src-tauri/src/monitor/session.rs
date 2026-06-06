@@ -1,13 +1,15 @@
 //! Reads recent Claude Code sessions from `~/.claude/projects`.
 //!
 //! Each session is a JSONL transcript at
-//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. We use the file's
-//! modification time as a liveness signal and parse a few fields out of the
-//! transcript for display (project, task title, cwd).
+//! `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Liveness comes from
+//! the timestamp of the last *conversational* record (a real user/assistant
+//! turn), not the file mtime — Claude rewrites metadata (titles, mode) on every
+//! window open, which would otherwise look like activity. We also parse a few
+//! fields out of the transcript for display (project, task title, cwd).
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// How many of the most-recently-touched transcripts we parse per poll.
 const MAX_SESSIONS: usize = 12;
@@ -21,14 +23,18 @@ pub struct SessionInfo {
     pub session_id: String,
     /// Launch directory of the session (for "open").
     pub cwd: String,
-    /// Last time the transcript was appended to — our RUNNING/IDLE signal.
+    /// File mtime. Moves on any write, including metadata-only writes Claude
+    /// makes when a window is merely opened or focused (custom-title, ai-title,
+    /// mode, queue-operation), so it is NOT a reliable "task running" signal.
+    /// Kept for cache invalidation / fallback only.
     pub modified: SystemTime,
-    /// The transcript ends with an assistant tool_use that has no tool_result
-    /// yet — i.e. Claude emitted a tool call and is blocked. Combined with the
-    /// latest hook event this distinguishes "running a tool" from "waiting for
-    /// the user to approve it" (the desktop app's stdio permission prompt does
-    /// not fire the Notification hook).
-    pub pending_tool_use: bool,
+    /// Timestamp of the last *conversational* record (a real `user` prompt or
+    /// `assistant` turn). This is our RUNNING/IDLE signal: unlike `modified` it
+    /// does not move when a window is just opened (metadata-only writes) and it
+    /// stops advancing the moment a task is interrupted (rate limit, error,
+    /// Ctrl-C), so a stalled task goes quiet and settles to idle. Falls back to
+    /// `modified` when no conversational record carries a parseable timestamp.
+    pub activity: SystemTime,
 }
 
 /// The most-recently-active transcript paths (newest first), capped and
@@ -95,7 +101,7 @@ pub fn parse_session(path: &Path, modified: SystemTime) -> Option<SessionInfo> {
     let mut title = String::new();
     let mut session_id = String::new();
     let mut last_user_prompt = String::new();
-    let mut pending_tool_use = false;
+    let mut last_activity: Option<SystemTime> = None;
 
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -128,18 +134,16 @@ pub fn parse_session(path: &Path, modified: SystemTime) -> Option<SessionInfo> {
                 }
             }
             Some("assistant") => {
-                // An assistant turn with a tool_use leaves a call outstanding.
-                if message_has(&v, "tool_use") {
-                    pending_tool_use = true;
+                if let Some(t) = record_time(&v) {
+                    last_activity = Some(t);
                 }
             }
             Some("user") => {
-                // A tool_result resolves the call; a fresh prompt starts anew.
-                if message_has(&v, "tool_result") {
-                    pending_tool_use = false;
-                } else if let Some(text) = extract_user_text(&v) {
+                if let Some(text) = extract_user_text(&v) {
                     last_user_prompt = text;
-                    pending_tool_use = false;
+                }
+                if let Some(t) = record_time(&v) {
+                    last_activity = Some(t);
                 }
             }
             _ => {}
@@ -174,22 +178,19 @@ pub fn parse_session(path: &Path, modified: SystemTime) -> Option<SessionInfo> {
         session_id,
         cwd,
         modified,
-        pending_tool_use,
+        // No parseable conversational timestamp (e.g. an empty or freshly
+        // opened session) → fall back to file mtime so behaviour degrades
+        // gracefully rather than treating the session as ancient.
+        activity: last_activity.unwrap_or(modified),
     })
 }
 
-/// True if the record's `message.content` array contains an item of the given
-/// type (e.g. "tool_use" or "tool_result").
-fn message_has(v: &serde_json::Value, kind: &str) -> bool {
-    v.get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_array())
-        .map(|items| {
-            items
-                .iter()
-                .any(|i| i.get("type").and_then(|t| t.as_str()) == Some(kind))
-        })
-        .unwrap_or(false)
+/// Parses a transcript record's RFC3339 `timestamp` into a `SystemTime`.
+/// Returns `None` for missing / unparseable / pre-epoch values.
+fn record_time(v: &serde_json::Value) -> Option<SystemTime> {
+    let s = v.get("timestamp").and_then(|t| t.as_str())?;
+    let secs = chrono::DateTime::parse_from_rfc3339(s).ok()?.timestamp();
+    (secs >= 0).then(|| UNIX_EPOCH + Duration::from_secs(secs as u64))
 }
 
 fn extract_user_text(v: &serde_json::Value) -> Option<String> {

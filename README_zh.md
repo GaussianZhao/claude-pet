@@ -47,28 +47,43 @@
 
 ---
 
-## 状态检测原理（混合方案）
+## 状态检测原理（Hook 驱动的状态机）
 
-在没有官方 API 的情况下，我们融合三路信号（`src-tauri/src/monitor/`）：
+没有官方「Claude 在干什么」的 API，因此状态由 **Claude Code 的生命周期 Hook** 驱动——这些 Hook 把每一轮对话「括起来」。每个会话取**最新一条** Hook 事件直接决定状态，我们信任事件，而不是靠文件时间去猜。
 
-1. **进程扫描** (`process.rs`) — 是否存在 `claude` CLI 或桌面进程？→ OFFLINE / 在线。每 ~5 秒轮询一次。
-2. **会话 Transcript** (`session.rs`) — 读取最新的 `~/.claude/projects/<cwd>/<session>.jsonl`，获取项目名、任务标题和活跃度（文件最后追加时间）。
-3. **Hook 推送文件** (`hooks.rs`) — `~/.claude/claude-pet/sessions/<id>.json`，Claude Code Hook 在 `Stop`/工具调用事件时写入。`COMPLETED` 状态可即时感知。
-4. **挂起工具调用启发式** — Transcript 最后一条是 assistant 发出的 `tool_use` 且没有对应 `tool_result`，且已安静 ≥5 秒 → 判定为 `WAITING`。这是唯一能捕捉 **桌面 App 权限确认弹窗** 的方式（桌面 App 不会触发 `Notification` Hook）。
+`hooks/claude-pet-hook.sh` 在每个事件时往 `~/.claude/claude-pet/sessions/<id>.json` 写一份；`monitor/hooks.rs` 读取，`monitor/mod.rs::hook_status()` 做映射：
 
-`monitor/mod.rs::compute()` 融合这几路信号：新鲜的 Hook 事件优先，但更新的 Transcript 活动可以覆盖（例如批准后继续工作）。
+| 最新 Hook 事件 | 状态 |
+| --- | --- |
+| `UserPromptSubmit`、`PreToolUse`、`PostToolUse`、`PostToolBatch`、`PermissionDenied` | **running（运行中）** |
+| `PermissionRequest`、`Notification[permission_prompt]` | **waiting（等待确认）** |
+| `Notification[idle_prompt]` | idle（空闲） |
+| `Stop` | **completed（完成，粘滞至确认）** |
+| `StopFailure`（API/限流错误） | **error（错误）** |
+| `SessionStart`、`SessionEnd` | idle（空闲） |
+
+关键特性：一轮任务从 `UserPromptSubmit` **持续 running 到终止事件**——在「思考中」或长耗时工具（如构建）静默运行期间**不会**被误判超时。两路辅助信号：
+
+- **进程扫描** (`process.rs`) — 是否存在 `claude` 进程？→ OFFLINE / 在线。每 ~5 秒轮询。
+- **会话 Transcript** (`session.rs`) — 读取最新的 `.jsonl` 获取项目名与任务标题。其**最后一条对话记录**（而非文件 mtime，因为打开窗口的元数据写入也会改 mtime）作为**兜底**活跃度信号，仅在某会话还没有 Hook（尚未安装）时使用。
+
+> **关于 `waiting` 与桌面 App：** 「等待确认」依赖 `PermissionRequest` / `Notification`。终端版 Claude Code 会发这些事件；部分桌面 App 版本可能不发，此时真实的权限弹窗会显示为 `running` 而非 `waiting`。这是有意为之——之前的「挂起工具调用启发式」会把长耗时工具误判为「等待」，已移除。
 
 ---
 
 ## 安装 Claude Code Hooks（推荐）
 
-不装 Hook 时，桌宠仍然可以显示 `离线 / 运行中 / 空闲 / 等待确认`（基于挂起工具调用启发式）。装了 Hook 之后还能可靠地感知 `completed`，并使用 Hook 时间戳作为状态切换时刻。
+安装脚本会把 Hook 脚本**拷贝到稳定位置**（`~/.claude/claude-pet/claude-pet-hook.sh`，与本仓库解耦），即使你移动或删除代码仓库，Hook 依然有效；并把事件注册合并进 `~/.claude/settings.json`：
 
 ```bash
-./hooks/install-hooks.sh   # 安全合并进 ~/.claude/settings.json（会备份原文件）
+./hooks/install-hooks.sh   # 安全、幂等；执行前会备份 settings.json
 ```
 
-安装后重启所有正在运行的 Claude 会话，使 Hook 生效。
+安装后请重启正在运行的 Claude / 桌面会话，使新注册的事件生效。
+
+不装 Hook 时桌宠仍能从 Transcript 兜底显示 `离线 / 运行中 / 空闲`，但 `等待确认 / 完成 / 错误` 需要 Hook。
+
+> 在环境变量中设置 `CLAUDE_PET_DEBUG=1` 可把每条 Hook 事件记录到 `~/.claude/claude-pet/events.log`（默认关闭；最多 400 行）。
 
 ---
 
@@ -100,7 +115,7 @@ npm run app:build    # dmg 生成在 src-tauri/target/release/bundle/dmg/
 | --- | ----------------------------------------- | --------------------------------------------- |
 | AC1 | 启动后显示桌宠                            | `tauri.conf.json` + `App.tsx`                 |
 | AC2 | 运行时 → 双臂捶击动画                     | `process.rs` + `PixelPet.animateRunning`      |
-| AC3 | 等待确认 → 挥手动画 + 系统通知            | 挂起工具调用启发式 → `animateWaiting`         |
+| AC3 | 等待确认 → 挥手动画 + 系统通知            | `PermissionRequest`/`Notification` Hook → `animateWaiting` |
 | AC4 | 完成 → 跳舞动画 + 系统通知               | `Stop` Hook → `animateCompleted`              |
 | AC5 | 点击桌宠 → 卡片面板（每任务一张）         | `Pet.tsx` + `StatusPanel.tsx`                 |
 | AC6 | 生成 macOS `.dmg` 安装包                  | `npm run app:build`                           |
@@ -108,6 +123,16 @@ npm run app:build    # dmg 生成在 src-tauri/target/release/bundle/dmg/
 ## 性能
 
 PRD 目标（CPU < 3%，内存 < 150MB）：monitor 每 5 秒做一次重扫描，每秒只读一次状态文件；空闲时动画降为 10fps，活跃时 30fps；Transcript 文件仅在 mtime 变化时才重新解析。
+
+## 长期在本机运行的注意事项
+
+如果打算一直装着、每天运行：
+
+- **Hook 脚本位于 `~/.claude/`，不在本仓库。** `install-hooks.sh` 会把它拷贝到 `~/.claude/claude-pet/`，所以删除/移动代码仓库不会影响你的 Claude 会话。重复运行安装脚本是幂等的（不会产生重复条目）。
+- **磁盘占用有界。** `~/.claude/claude-pet/sessions/` 下的会话状态文件超过 1 天会被清理；调试用 `events.log` **默认关闭**（通过 `CLAUDE_PET_DEBUG=1` 开启），且最多 400 行。
+- **超大 Transcript。** 会话 `.jsonl` 在 mtime 变化时（活跃时约每 5 秒）会被整文件解析；超长会话（数十 MB）解析开销较大；按 mtime 缓存，空闲会话零开销。
+- **更新 Hook。** 如果改了 `hooks/claude-pet-hook.sh`，需重新运行 `./hooks/install-hooks.sh` 把新版本拷贝进 `~/.claude/`。
+- **升级 Claude Code。** Hook 写在用户 `settings.json` 里，升级后依然保留；新事件（`PermissionRequest`、`StopFailure` 等）在不支持的版本中会被忽略，无副作用。
 
 ---
 

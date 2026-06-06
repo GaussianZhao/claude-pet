@@ -30,6 +30,11 @@ pub struct HookStatus {
     pub ts: i64,
     #[serde(default)]
     pub message: String,
+    /// For `Notification` events: which kind, e.g. "permission_prompt" (Claude
+    /// needs approval) or "idle_prompt" (Claude is waiting for input). Lets us
+    /// tell a real approval wait from a routine idle nudge.
+    #[serde(default)]
+    pub notification_type: String,
 }
 
 fn sessions_dir() -> Option<PathBuf> {

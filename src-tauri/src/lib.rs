@@ -7,6 +7,7 @@
 mod monitor;
 
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
@@ -34,9 +35,16 @@ struct AppState {
     acked: Mutex<HashMap<String, i64>>,
     /// session_id → (current status, unix ts it entered that status).
     since: Mutex<HashMap<String, (TaskStatus, i64)>>,
-    /// The pet's fixed bottom-center (logical screen px) while the panel is
-    /// open, captured once on open so repeated resizes don't drift.
+    /// The pet's fixed bottom-center (logical screen px). Captured on open and
+    /// kept current as the user drags, so the card always lays out around the
+    /// pet's real position.
     anchor: Mutex<Option<(f64, f64)>>,
+    /// The pet's bottom-center relative to the window's top-left, from the last
+    /// layout. Lets the Moved handler turn a window drag into an updated anchor.
+    pet_rel: Mutex<Option<(f64, f64)>>,
+    /// Set while we move the window ourselves, so the Moved handler ignores it
+    /// (only genuine user drags should update the anchor).
+    suppress_move: AtomicBool,
     tray: Mutex<Tray>,
 }
 
@@ -103,47 +111,144 @@ fn set_always_on_top(window: tauri::WebviewWindow, value: bool) -> Result<(), St
     window.set_always_on_top(value).map_err(|e| e.to_string())
 }
 
-/// Resizes the window to `width`×`height` logical px while keeping its
-/// BOTTOM-CENTER fixed: the panel expands up/out over the desktop and the pet
-/// doesn't move. The window stays small (just the pet) when the panel is closed,
-/// so the surrounding transparent area doesn't swallow desktop clicks.
+/// Where to place the pet and the card inside the window (logical px, relative
+/// to the window's top-left). Returned to the webview so it can position them
+/// with CSS — the pet stays put on screen while the card shifts to stay visible.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Layout {
+    pet_left: f64,
+    pet_bottom: f64,
+    panel_left: f64,
+    panel_top: f64,
+}
+
+/// Lays out the window so the PET keeps a fixed position on screen and only the
+/// CARD moves to stay on-monitor.
+///
+/// The pet's bottom-center (`anchor`) never changes. When the card is open we
+/// place it centered above the pet, then clamp that rectangle onto the current
+/// monitor; the window becomes the bounding box of (pet ∪ card) and the webview
+/// positions each piece via the returned offsets. So at an edge or corner the
+/// pet stays exactly where it is and the card slides over just enough to be
+/// fully visible. When closed the window is just the pet's footprint.
 #[tauri::command]
 fn resize_window(
     window: tauri::WebviewWindow,
     state: tauri::State<AppState>,
-    width: f64,
-    height: f64,
+    open: bool,
+    panel_h: f64,
+    closed_w: f64,
+    open_w: f64,
+    base_h: f64,
     anchor: bool,
-) -> Result<(), String> {
-    let scale = window.scale_factor().map_err(|e| e.to_string())?;
-    let mut stored = state.anchor.lock().unwrap();
+) -> Result<Layout, String> {
+    use std::sync::atomic::Ordering;
 
-    // Recompute the bottom-center from live geometry only when asked (on open)
-    // or if we don't have one yet; otherwise reuse it so repeated resizes can't
-    // drift from stale reads.
-    let (center_x, bottom_y) = if anchor || stored.is_none() {
-        let pos = window
-            .outer_position()
-            .map_err(|e| e.to_string())?
-            .to_logical::<f64>(scale);
-        let size = window
-            .inner_size()
-            .map_err(|e| e.to_string())?
-            .to_logical::<f64>(scale);
-        let v = (pos.x + size.width / 2.0, pos.y + size.height);
-        *stored = Some(v);
-        v
-    } else {
-        stored.unwrap()
+    let scale = window.scale_factor().map_err(|e| e.to_string())?;
+
+    // Pet's fixed bottom-center on screen. Recompute from live geometry on the
+    // open transition (or first run); otherwise reuse the tracked anchor, which
+    // the Moved handler keeps current across user drags.
+    let (ax, ay) = {
+        let mut stored = state.anchor.lock().unwrap();
+        if anchor || stored.is_none() {
+            let pos = window
+                .outer_position()
+                .map_err(|e| e.to_string())?
+                .to_logical::<f64>(scale);
+            let size = window
+                .inner_size()
+                .map_err(|e| e.to_string())?
+                .to_logical::<f64>(scale);
+            let v = (pos.x + size.width / 2.0, pos.y + size.height);
+            *stored = Some(v);
+            v
+        } else {
+            stored.unwrap()
+        }
     };
 
-    window
-        .set_size(LogicalSize::new(width, height))
-        .map_err(|e| e.to_string())?;
-    window
-        .set_position(LogicalPosition::new(center_x - width / 2.0, bottom_y - height))
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    // Pet footprint (closed size), bottom-anchored at (ax, ay).
+    let pet_left = ax - closed_w / 2.0;
+    let pet_top = ay - base_h;
+    let pet_right = ax + closed_w / 2.0;
+    let pet_bottom = ay;
+
+    let (win_left, win_top, win_w, win_h, layout) = if open {
+        // Card centered directly above the pet...
+        let ideal_left = ax - open_w / 2.0;
+        let ideal_top = ay - base_h - panel_h;
+        // ...then nudged onto the current monitor so it never spills off-screen.
+        let (mut pl, mut pt) = (ideal_left, ideal_top);
+        if let Ok(Some(m)) = window.current_monitor() {
+            let mp = m.position().to_logical::<f64>(scale);
+            let ms = m.size().to_logical::<f64>(scale);
+            let max_x = mp.x + ms.width - open_w;
+            let max_y = mp.y + ms.height - panel_h;
+            if max_x >= mp.x {
+                pl = pl.clamp(mp.x, max_x);
+            }
+            if max_y >= mp.y {
+                pt = pt.clamp(mp.y, max_y);
+            }
+        }
+
+        // Window = bounding box of the pet footprint and the (clamped) card.
+        let win_left = pet_left.min(pl);
+        let win_top = pet_top.min(pt);
+        let win_right = pet_right.max(pl + open_w);
+        let win_bottom = pet_bottom.max(pt + panel_h);
+
+        let layout = Layout {
+            pet_left: pet_left - win_left,
+            pet_bottom: win_bottom - pet_bottom,
+            panel_left: pl - win_left,
+            panel_top: pt - win_top,
+        };
+        (
+            win_left,
+            win_top,
+            win_right - win_left,
+            win_bottom - win_top,
+            layout,
+        )
+    } else {
+        (
+            pet_left,
+            pet_top,
+            closed_w,
+            base_h,
+            Layout {
+                pet_left: 0.0,
+                pet_bottom: 0.0,
+                panel_left: 0.0,
+                panel_top: 0.0,
+            },
+        )
+    };
+
+    // Record the pet's bottom-center relative to the window origin *before*
+    // moving, so a later user drag (which only moves the window) keeps the
+    // anchor correct via the Moved handler.
+    *state.pet_rel.lock().unwrap() = Some((ax - win_left, ay - win_top));
+
+    // Apply geometry, suppressing the Moved handler so our own set_position
+    // isn't mistaken for a user drag.
+    state.suppress_move.store(true, Ordering::SeqCst);
+    let r = (|| {
+        window
+            .set_size(LogicalSize::new(win_w, win_h))
+            .map_err(|e| e.to_string())?;
+        window
+            .set_position(LogicalPosition::new(win_left, win_top))
+            .map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })();
+    state.suppress_move.store(false, Ordering::SeqCst);
+    r?;
+
+    Ok(layout)
 }
 
 fn status_label(s: &TaskStatus) -> &'static str {
@@ -414,6 +519,8 @@ pub fn run() {
             acked: Mutex::new(HashMap::new()),
             since: Mutex::new(HashMap::new()),
             anchor: Mutex::new(None),
+            pet_rel: Mutex::new(None),
+            suppress_move: AtomicBool::new(false),
             tray: Mutex::new(Tray::default()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -429,6 +536,29 @@ pub fn run() {
                 let _ = win.show();
                 let _ = win.set_always_on_top(true);
                 let _ = win.set_visible_on_all_workspaces(true);
+
+                // Track user drags: when the window moves (and it wasn't us
+                // resizing), recompute the pet's anchor from the new position so
+                // closing the card afterwards keeps the pet where it was dropped.
+                let handle = app.handle().clone();
+                let win_evt = win.clone();
+                win.on_window_event(move |event| {
+                    use std::sync::atomic::Ordering;
+                    if let tauri::WindowEvent::Moved(pos) = event {
+                        let state = handle.state::<AppState>();
+                        if state.suppress_move.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let Ok(scale) = win_evt.scale_factor() else {
+                            return;
+                        };
+                        let (lx, ly) = (pos.x as f64 / scale, pos.y as f64 / scale);
+                        let rel = *state.pet_rel.lock().unwrap();
+                        if let Some((rx, ry)) = rel {
+                            *state.anchor.lock().unwrap() = Some((lx + rx, ly + ry));
+                        }
+                    }
+                });
             }
             setup_tray(app)?;
             spawn_monitor(app.handle().clone());

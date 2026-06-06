@@ -22,11 +22,6 @@ const IDLE_AFTER: i64 = 45;
 const HOOK_FRESH: i64 = 3600;
 /// An IDLE task stops being shown once it's been idle this long (10 min).
 const SHOW_WINDOW: i64 = 600;
-/// A pending tool_use must sit quiet this long before we call it "waiting for
-/// approval" (avoids flagging normal fast tool calls; a tool that genuinely
-/// runs longer than this will briefly show as waiting too — there's no external
-/// way to tell a permission wait from a long-running tool).
-const WAITING_QUIET: i64 = 5;
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -105,24 +100,20 @@ pub fn compute(
         .iter()
         .map(|s| {
             let modified_ts = systemtime_unix(s.modified);
-            let jsonl_age = if modified_ts == 0 {
+            // Liveness is driven by the last *conversational* record, not the
+            // file mtime — so opening a window (a metadata-only write) or a task
+            // stalling on a rate limit no longer reads as "running".
+            let activity_ts = systemtime_unix(s.activity);
+            let jsonl_age = if activity_ts == 0 {
                 i64::MAX
             } else {
-                now - modified_ts
+                now - activity_ts
             };
             let hook = hooks.get(&s.session_id).filter(|h| now - h.ts <= HOOK_FRESH);
             let prev_status = prev.get(&s.session_id).cloned().unwrap_or(TaskStatus::Idle);
             let ack_ts = acked.get(&s.session_id).copied().unwrap_or(0);
 
-            let status = compute_session(
-                running,
-                modified_ts,
-                jsonl_age,
-                hook,
-                &prev_status,
-                ack_ts,
-                s.pending_tool_use,
-            );
+            let status = compute_session(running, jsonl_age, hook, &prev_status, ack_ts);
 
             (
                 SessionState {
@@ -163,55 +154,37 @@ pub fn compute(
 
 fn compute_session(
     running: bool,
-    modified_ts: i64,
     jsonl_age: i64,
     hook: Option<&HookStatus>,
     prev: &TaskStatus,
     ack_ts: i64,
-    pending_tool_use: bool,
 ) -> TaskStatus {
-    let hook_ts = hook.map(|h| h.ts).unwrap_or(0);
-    let resumed_after_hook = modified_ts > hook_ts + 1;
-    // Claude emitted a tool call (assistant tool_use, no tool_result yet) and
-    // has gone quiet → it's blocked, almost always on the user's approval. This
-    // is how we catch the desktop app's stdio permission prompt, which fires
-    // NO Notification hook and leaves PreToolUse as the latest event.
-    let awaiting_approval = pending_tool_use && jsonl_age >= WAITING_QUIET;
-
     match hook.and_then(hook_status) {
-        Some(TaskStatus::Waiting) => {
-            if resumed_after_hook && jsonl_age < RUNNING_WINDOW {
-                TaskStatus::Running
-            } else {
-                TaskStatus::Waiting
-            }
-        }
-        Some(TaskStatus::Completed) => {
-            if resumed_after_hook && jsonl_age < RUNNING_WINDOW {
-                TaskStatus::Running
-            } else if ack_ts >= hook_ts {
-                // Acknowledged (user opened it) → it may settle to idle.
-                TaskStatus::Idle
-            } else {
-                // Sticky: stays completed until acknowledged.
-                TaskStatus::Completed
-            }
-        }
+        // RUNNING from UserPromptSubmit until a terminal event. We deliberately
+        // do NOT decay on transcript quiet: a long "thinking" gap or a
+        // long-running tool (e.g. a build) produces no records, but the turn is
+        // still in progress — the bracketing Stop / StopFailure hook is what
+        // ends it.
+        Some(TaskStatus::Running) => TaskStatus::Running,
+        // Authoritative approval wait (PermissionRequest / Notification). No
+        // more guessing from a pending tool call, which mislabels slow tools.
+        Some(TaskStatus::Waiting) => TaskStatus::Waiting,
         Some(TaskStatus::Error) => TaskStatus::Error,
-        Some(TaskStatus::Running) => {
-            if awaiting_approval {
-                TaskStatus::Waiting
+        Some(TaskStatus::Completed) => {
+            let hook_ts = hook.map(|h| h.ts).unwrap_or(0);
+            if ack_ts >= hook_ts {
+                TaskStatus::Idle // acknowledged (user opened it) → settle
             } else {
-                TaskStatus::Running
+                TaskStatus::Completed // sticky until acknowledged
             }
         }
         Some(TaskStatus::Idle) => TaskStatus::Idle,
+        // No hook for this session (hooks not installed, or it predates them):
+        // fall back to transcript liveness. Uses conversational activity (not
+        // file mtime), so merely opening a window doesn't read as running.
         None => {
             if !running {
                 return TaskStatus::Idle;
-            }
-            if awaiting_approval {
-                return TaskStatus::Waiting;
             }
             let quiet_limit = if *prev == TaskStatus::Running {
                 IDLE_AFTER
@@ -227,19 +200,43 @@ fn compute_session(
     }
 }
 
-/// Maps a hook event/status string onto a task status (None = defer to liveness).
+/// Maps the latest hook event onto a task status (None = defer to liveness).
+///
+/// This is the heart of the state machine: Claude Code brackets a turn with
+/// events, and the most recent one tells us the state directly. We trust it
+/// rather than guessing from transcript timing.
 pub fn hook_status(h: &HookStatus) -> Option<TaskStatus> {
-    let key = if !h.status.is_empty() {
-        h.status.as_str()
-    } else {
-        h.event.as_str()
-    };
-    match key {
-        "waiting" | "Notification" => Some(TaskStatus::Waiting),
-        "completed" | "Stop" => Some(TaskStatus::Completed),
-        "error" | "Error" => Some(TaskStatus::Error),
-        "running" | "PreToolUse" | "PostToolUse" | "UserPromptSubmit" => Some(TaskStatus::Running),
-        "idle" => Some(TaskStatus::Idle),
+    // An explicit status override wins (manual / forward-compat).
+    if !h.status.is_empty() {
+        return match h.status.as_str() {
+            "waiting" => Some(TaskStatus::Waiting),
+            "completed" => Some(TaskStatus::Completed),
+            "error" => Some(TaskStatus::Error),
+            "running" => Some(TaskStatus::Running),
+            "idle" => Some(TaskStatus::Idle),
+            _ => None,
+        };
+    }
+    match h.event.as_str() {
+        // Turn is in progress — running until a terminal event arrives. Covers
+        // "thinking" gaps and long-running tools, which legitimately go quiet.
+        "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "PostToolUseFailure"
+        | "PostToolBatch" | "PermissionDenied" => Some(TaskStatus::Running),
+        // Authoritative "Claude needs you" signals.
+        "PermissionRequest" => Some(TaskStatus::Waiting),
+        "Notification" => match h.notification_type.as_str() {
+            "permission_prompt" => Some(TaskStatus::Waiting),
+            // Idle nudge ("waiting for your input") — the turn is already done.
+            "idle_prompt" => Some(TaskStatus::Idle),
+            // Pre-`notification_type` builds only sent Notification for approval.
+            "" => Some(TaskStatus::Waiting),
+            _ => None,
+        },
+        // Turn ended.
+        "Stop" => Some(TaskStatus::Completed),
+        "StopFailure" => Some(TaskStatus::Error),
+        // Session boundaries — nothing is running yet / anymore.
+        "SessionStart" | "SessionEnd" => Some(TaskStatus::Idle),
         _ => None,
     }
 }
@@ -304,6 +301,21 @@ mod tests {
         m
     }
 
+    fn notif(notification_type: &str, ts: i64) -> HashMap<String, HookStatus> {
+        let mut m = HashMap::new();
+        m.insert(
+            "s1".to_string(),
+            HookStatus {
+                event: "Notification".into(),
+                notification_type: notification_type.into(),
+                session_id: "s1".into(),
+                ts,
+                ..Default::default()
+            },
+        );
+        m
+    }
+
     fn one_session() -> Vec<SessionInfo> {
         vec![SessionInfo {
             project: "proj".into(),
@@ -311,8 +323,19 @@ mod tests {
             session_id: "s1".into(),
             cwd: "/tmp/proj".into(),
             modified: SystemTime::now(),
-            pending_tool_use: false,
+            activity: SystemTime::now(),
         }]
+    }
+
+    fn at(unix: i64) -> SystemTime {
+        UNIX_EPOCH + std::time::Duration::from_secs(unix as u64)
+    }
+
+    /// Age both the file mtime and the conversational-activity time of the only
+    /// session to `unix`, mirroring a transcript whose last real turn was then.
+    fn age_activity(sessions: &mut [SessionInfo], unix: i64) {
+        sessions[0].modified = at(unix);
+        sessions[0].activity = at(unix);
     }
 
     #[test]
@@ -333,7 +356,7 @@ mod tests {
         // Stop fired a minute ago; transcript hasn't moved since.
         let stop = unix_now() - 60;
         let mut sessions = one_session();
-        sessions[0].modified = UNIX_EPOCH + std::time::Duration::from_secs(stop as u64);
+        age_activity(&mut sessions, stop);
 
         let unacked = compute(
             true,
@@ -363,18 +386,32 @@ mod tests {
     }
 
     #[test]
-    fn pending_tool_use_without_pretool_is_waiting() {
-        // Tool call outstanding for >WAITING_QUIET, latest hook is PostToolUse
-        // (not PreToolUse) → the user is being asked to approve it.
+    fn long_tool_or_thinking_stays_running() {
+        // Mid-turn the transcript can go silent for a long time (a slow build,
+        // or the model "thinking"). The latest hook is still a running event, so
+        // we must stay RUNNING and never flip to waiting or idle.
+        let old = unix_now() - 600; // 10 min of silence
         let mut sessions = one_session();
-        sessions[0].pending_tool_use = true;
-        let old = unix_now() - 10;
-        sessions[0].modified = UNIX_EPOCH + std::time::Duration::from_secs(old as u64);
+        age_activity(&mut sessions, old);
 
+        for ev in ["PreToolUse", "PostToolUse", "UserPromptSubmit"] {
+            let s = compute(
+                true,
+                &sessions,
+                &hook(ev, old),
+                &HashMap::new(),
+                &HashMap::new(),
+            );
+            assert_eq!(s.status, TaskStatus::Running, "{ev} should stay running");
+        }
+    }
+
+    #[test]
+    fn permission_request_is_waiting() {
         let s = compute(
             true,
-            &sessions,
-            &hook("PostToolUse", old),
+            &one_session(),
+            &hook("PermissionRequest", unix_now()),
             &HashMap::new(),
             &HashMap::new(),
         );
@@ -382,37 +419,77 @@ mod tests {
     }
 
     #[test]
-    fn pending_tool_use_with_pretool_is_also_waiting() {
-        // PreToolUse fires BEFORE the permission prompt, so a pending tool_use
-        // that's gone quiet is waiting even when PreToolUse is the latest event.
-        let mut sessions = one_session();
-        sessions[0].pending_tool_use = true;
-        let old = unix_now() - 10;
-        sessions[0].modified = UNIX_EPOCH + std::time::Duration::from_secs(old as u64);
-
-        let s = compute(
+    fn notification_kinds_map_correctly() {
+        // permission_prompt → waiting; idle_prompt → idle.
+        let w = compute(
             true,
-            &sessions,
-            &hook("PreToolUse", old),
+            &one_session(),
+            &notif("permission_prompt", unix_now()),
             &HashMap::new(),
             &HashMap::new(),
         );
-        assert_eq!(s.status, TaskStatus::Waiting);
+        assert_eq!(w.status, TaskStatus::Waiting);
+
+        let i = compute(
+            true,
+            &one_session(),
+            &notif("idle_prompt", unix_now()),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(i.status, TaskStatus::Idle);
     }
 
     #[test]
-    fn fresh_tool_call_is_not_yet_waiting() {
-        // A pending tool_use that's still fresh (< WAITING_QUIET) is running,
-        // so normal fast tool calls don't flicker to waiting.
-        let mut sessions = one_session();
-        sessions[0].pending_tool_use = true; // modified = now (fresh)
+    fn stop_failure_is_error() {
         let s = compute(
             true,
-            &sessions,
-            &hook("PreToolUse", unix_now()),
+            &one_session(),
+            &hook("StopFailure", unix_now()),
             &HashMap::new(),
             &HashMap::new(),
         );
+        assert_eq!(s.status, TaskStatus::Error);
+    }
+
+    #[test]
+    fn session_start_is_idle() {
+        // Opening/resuming a session fires SessionStart — nothing is running.
+        let s = compute(
+            true,
+            &one_session(),
+            &hook("SessionStart", unix_now()),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(s.status, TaskStatus::Idle);
+    }
+
+    #[test]
+    fn opening_a_window_does_not_read_as_running() {
+        // A window was just opened/focused: Claude wrote metadata (title, mode)
+        // so the file mtime is fresh, but the last real turn (activity) is old
+        // and no claude-pet hook has fired for this session yet. The pet must
+        // stay idle, not flip to running.
+        let mut sessions = one_session();
+        sessions[0].modified = at(unix_now()); // fresh metadata write
+        sessions[0].activity = at(unix_now() - 300); // last real turn 5 min ago
+        let s = compute(true, &sessions, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(s.status, TaskStatus::Idle);
+    }
+
+    #[test]
+    fn no_hook_falls_back_to_liveness() {
+        // Without any hook (hooks not installed / pre-install session), recent
+        // conversational activity reads as running; long silence reads as idle.
+        let mut live = one_session();
+        age_activity(&mut live, unix_now() - 2);
+        let s = compute(true, &live, &HashMap::new(), &HashMap::new(), &HashMap::new());
         assert_eq!(s.status, TaskStatus::Running);
+
+        let mut quiet = one_session();
+        age_activity(&mut quiet, unix_now() - (IDLE_AFTER + 60));
+        let s2 = compute(true, &quiet, &HashMap::new(), &HashMap::new(), &HashMap::new());
+        assert_eq!(s2.status, TaskStatus::Idle);
     }
 }

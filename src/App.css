@@ -6,13 +6,13 @@
   overflow: hidden;
 }
 
-/* Pet pinned to the bottom of the window. Its canvas (180px) is taller than
-   BASE_H, so its transparent top overflows upward *behind* the panel. */
+/* Pet box inside the window. Its on-screen position is fixed; `left`/`bottom`
+   are set inline from the backend layout so the pet stays put while the window
+   grows around it (and the card shifts) near a screen edge. */
 .pet-anchor {
   position: absolute;
-  bottom: 0;
-  left: 0;
-  right: 0;
+  /* left + bottom come from inline styles (default 0,0 when closed). */
+  width: 150px;
   height: 150px;
   display: flex;
   align-items: flex-end;
@@ -32,9 +32,8 @@
 /* ---- Card panel (above the pet) ---- */
 .panel-wrap {
   position: absolute;
-  top: 0;
-  left: 0;
-  right: 0;
+  /* left/top/width come from inline styles (backend layout). The card slides
+     horizontally/vertically to stay on-screen while the pet stays put. */
   /* Above the pet so the pet's transparent canvas-top can't intercept card
      clicks where they overlap. Height is content-driven (measured in App.tsx). */
   z-index: 2;

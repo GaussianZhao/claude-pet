@@ -52,6 +52,8 @@ export function Pet({
       d.moved = true;
       if (isTauri) {
         const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        // The backend's Moved handler keeps the pet's anchor in sync as the
+        // window moves, so closing the card after a drag keeps the pet put.
         getCurrentWindow().startDragging();
       }
     }

@@ -60,40 +60,66 @@ as JSON — handy for verifying detection without opening the UI.
 
 ---
 
-## How state detection works (hybrid)
+## How state detection works (hook-driven state machine)
 
-The hard part is knowing Claude's state without an official API. Three signals
-fused in `src-tauri/src/monitor/`:
+There's no official "what is Claude doing" API, so the state is driven by
+**Claude Code's lifecycle hooks**, which bracket every turn. The most recent
+hook event for a session decides its state directly — we trust the events
+rather than guessing from file timing.
 
-1. **Process scan** (`process.rs`) — is a `claude` CLI / desktop process alive?
-   → `OFFLINE` vs alive. Polled every ~5 s.
-2. **Session transcript** (`session.rs`) — the newest
-   `~/.claude/projects/<cwd>/<session>.jsonl`. Gives project name, task title,
-   and liveness (how recently the file was appended).
-3. **Hook push files** (`hooks.rs`) — `~/.claude/claude-pet/sessions/<id>.json`,
-   written by a Claude Code hook on `Stop` / tool-use events. Provides
-   `COMPLETED` instantly.
-4. **Pending tool-use heuristic** — the transcript ends with an assistant
-   `tool_use` that has no `tool_result` yet, and has been quiet ≥ 5 s → `WAITING`.
-   This is the only way to catch the desktop app's permission prompt, which does
-   **not** fire the `Notification` hook.
+`hooks/claude-pet-hook.sh` writes one file per session to
+`~/.claude/claude-pet/sessions/<id>.json` on each event; `monitor/hooks.rs`
+reads them and `monitor/mod.rs::hook_status()` maps the latest event:
 
-`monitor/mod.rs::compute()` fuses the signals. A fresh hook event wins, but
-newer transcript activity can override it (e.g. work resumed after approval).
+| Latest hook event | State |
+| --- | --- |
+| `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PostToolBatch`, `PermissionDenied` | **running** |
+| `PermissionRequest`, `Notification[permission_prompt]` | **waiting** |
+| `Notification[idle_prompt]` | idle |
+| `Stop` | **completed** (sticky until acknowledged) |
+| `StopFailure` (API/rate-limit error) | **error** |
+| `SessionStart`, `SessionEnd` | idle |
+
+Key property: a turn is **running from `UserPromptSubmit` until a terminal
+event** — it is *not* timed out while "thinking" or while a long tool (e.g. a
+build) runs silently. Two supporting signals:
+
+- **Process scan** (`process.rs`) — is a `claude` process alive at all? →
+  `OFFLINE` vs alive. Polled every ~5 s.
+- **Session transcript** (`session.rs`) — the newest
+  `~/.claude/projects/<cwd>/<session>.jsonl` provides project name and task
+  title. Its last *conversational* record (not the file mtime, which moves on
+  metadata writes) is a liveness **fallback** used only when a session has no
+  hook (hooks not installed yet).
+
+> **Note on `waiting` and the desktop app:** "waiting for approval" relies on
+> `PermissionRequest` / `Notification`. Terminal Claude Code emits these; some
+> desktop-app builds may not, in which case a real permission prompt shows as
+> `running` rather than `waiting`. This is deliberate — the previous
+> pending-tool-use heuristic was removed because it mislabelled long-running
+> tools as "waiting".
 
 ---
 
 ## Install the hooks (recommended)
 
-Without hooks the pet still shows `offline / running / idle / waiting`
-(via the pending-tool-use heuristic). With hooks you also get reliable
-`completed` and can rely on hook timestamps for state times.
+The installer **copies** the hook script to a stable location
+(`~/.claude/claude-pet/claude-pet-hook.sh`) — independent of this repo, so the
+hooks keep working even if you move or delete the checkout — and merges the
+event registrations into `~/.claude/settings.json`:
 
 ```bash
-./hooks/install-hooks.sh   # merges into ~/.claude/settings.json (backs it up)
+./hooks/install-hooks.sh   # safe + idempotent; backs up settings.json first
 ```
 
-Restart any open Claude Code sessions afterwards.
+Restart any open Claude Code / desktop sessions afterwards so they pick up the
+newly registered events.
+
+Without hooks the pet still shows `offline / running / idle` from the transcript
+fallback, but `waiting` / `completed` / `error` need the hooks.
+
+> Set `CLAUDE_PET_DEBUG=1` in the environment to log every hook event to
+> `~/.claude/claude-pet/events.log` (off by default; capped at 400 lines).
 
 ---
 
@@ -128,7 +154,7 @@ npm run app:build    # .dmg lands in src-tauri/target/release/bundle/dmg/
 | --- | ------------------------------------------- | ---------------------------------------- |
 | AC1 | Pet shows on launch                         | `tauri.conf.json` window + `App.tsx`     |
 | AC2 | Running → arm-hammering animation           | `process.rs` + `PixelPet.animateRunning` |
-| AC3 | Waiting → wave animation + notify           | pending-tool-use heuristic → `animateWaiting` |
+| AC3 | Waiting → wave animation + notify           | `PermissionRequest`/`Notification` hook → `animateWaiting` |
 | AC4 | Completed → dance animation + notify        | `Stop` hook → `animateCompleted`         |
 | AC5 | Click pet → card panel (one card per task)  | `Pet.tsx` + `StatusPanel.tsx`            |
 | AC6 | macOS `.dmg` installer                      | `npm run app:build`                      |
@@ -139,6 +165,26 @@ Targets from the PRD (CPU < 3%, RAM < 150MB): monitor does a heavy scan only
 every 5 s and a cheap file read each second; the pet animation runs at 10 fps
 when idle, 30 fps when active; transcripts are only re-parsed when their mtime
 changes.
+
+## Running long-term on your machine
+
+Notes for leaving it installed and running every day:
+
+- **Hook script lives in `~/.claude/`, not this repo.** `install-hooks.sh` copies
+  it to `~/.claude/claude-pet/`, so deleting/moving the checkout won't break your
+  Claude sessions. Re-running the installer is idempotent (no duplicate entries).
+- **Bounded disk usage.** Per-session status files in
+  `~/.claude/claude-pet/sessions/` are pruned after 1 day. The debug
+  `events.log` is **off by default** (opt-in via `CLAUDE_PET_DEBUG=1`) and capped
+  at 400 lines.
+- **Large transcripts.** A session's `.jsonl` is parsed in full whenever its
+  mtime changes (~every 5 s while active). Very long sessions (tens of MB) make
+  that parse heavier; it's cached by mtime so idle sessions cost nothing.
+- **Updating the hook.** If you change `hooks/claude-pet-hook.sh`, re-run
+  `./hooks/install-hooks.sh` to copy the new version into `~/.claude/`.
+- **Upgrading Claude Code.** Hooks live in your user `settings.json` and persist
+  across upgrades. Newer events (`PermissionRequest`, `StopFailure`, …) are
+  ignored by versions that don't emit them — harmless.
 
 ---
 
