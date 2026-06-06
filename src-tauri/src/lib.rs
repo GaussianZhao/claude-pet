@@ -27,7 +27,50 @@ use tauri_plugin_notification::NotificationExt;
 struct Tray {
     status: Option<MenuItem<Wry>>,
     ontop: Option<CheckMenuItem<Wry>>,
+    hidedock: Option<CheckMenuItem<Wry>>,
 }
+
+/// Path of the small persisted-preferences file (~/.claude/claude-pet/config.json).
+fn config_file() -> Option<std::path::PathBuf> {
+    dirs::home_dir().map(|h| {
+        h.join(".claude")
+            .join("claude-pet")
+            .join("config.json")
+    })
+}
+
+/// Whether the user chose to hide the Dock icon (persisted across launches).
+fn load_hide_dock() -> bool {
+    let Some(p) = config_file() else { return false };
+    std::fs::read_to_string(p)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("hideDock").and_then(|b| b.as_bool()))
+        .unwrap_or(false)
+}
+
+fn save_hide_dock(hide: bool) {
+    let Some(p) = config_file() else { return };
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let body = serde_json::json!({ "hideDock": hide });
+    let _ = std::fs::write(p, serde_json::to_string_pretty(&body).unwrap_or_default());
+}
+
+/// Show or hide the Dock icon by switching the macOS activation policy.
+/// `Accessory` = menu-bar/tray app with no Dock tile; `Regular` = normal.
+#[cfg(target_os = "macos")]
+fn apply_dock_visibility(app: &tauri::AppHandle, hide: bool) {
+    let policy = if hide {
+        tauri::ActivationPolicy::Accessory
+    } else {
+        tauri::ActivationPolicy::Regular
+    };
+    let _ = app.set_activation_policy(policy);
+}
+#[cfg(not(target_os = "macos"))]
+fn apply_dock_visibility(_app: &tauri::AppHandle, _hide: bool) {}
 
 struct AppState {
     last: Mutex<PetState>,
@@ -455,6 +498,20 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
                 }
             }
         }
+        "hidedock" => {
+            // The check item has already toggled; read its new state and apply.
+            let hide = app
+                .state::<AppState>()
+                .tray
+                .lock()
+                .unwrap()
+                .hidedock
+                .as_ref()
+                .and_then(|i| i.is_checked().ok())
+                .unwrap_or(false);
+            apply_dock_visibility(app, hide);
+            save_hide_dock(hide);
+        }
         _ => {}
     }
 }
@@ -472,6 +529,9 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let autostart = CheckMenuItemBuilder::with_id("autostart", "Launch at Login")
         .checked(autostart_on)
         .build(app)?;
+    let hidedock = CheckMenuItemBuilder::with_id("hidedock", "Hide Dock Icon")
+        .checked(load_hide_dock())
+        .build(app)?;
     let quit = MenuItemBuilder::with_id("quit", "Quit Claude Pet").build(app)?;
 
     let menu = MenuBuilder::new(app)
@@ -482,18 +542,19 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
             &hide,
             &ontop,
             &autostart,
+            &hidedock,
             &PredefinedMenuItem::separator(app)?,
             &quit,
         ])
         .build()?;
 
-    let icon = app
-        .default_window_icon()
-        .cloned()
-        .ok_or_else(|| tauri::Error::AssetNotFound("default window icon".into()))?;
+    // Monochrome menu-bar icon: a *template* image (black + alpha), which macOS
+    // recolors to match the light/dark menu bar automatically.
+    let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/tray.png"))?;
 
     TrayIconBuilder::with_id("main")
         .icon(icon)
+        .icon_as_template(true)
         .tooltip("Claude Pet")
         .menu(&menu)
         .on_menu_event(handle_menu_event)
@@ -503,6 +564,7 @@ fn setup_tray(app: &tauri::App) -> tauri::Result<()> {
     let mut tray = state.tray.lock().unwrap();
     tray.status = Some(status);
     tray.ontop = Some(ontop);
+    tray.hidedock = Some(hidedock);
     Ok(())
 }
 
@@ -561,6 +623,8 @@ pub fn run() {
                 });
             }
             setup_tray(app)?;
+            // Apply the persisted Dock-icon preference on launch.
+            apply_dock_visibility(&app.handle().clone(), load_hide_dock());
             spawn_monitor(app.handle().clone());
             Ok(())
         })

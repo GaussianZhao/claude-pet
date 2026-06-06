@@ -22,6 +22,19 @@ const IDLE_AFTER: i64 = 45;
 const HOOK_FRESH: i64 = 3600;
 /// An IDLE task stops being shown once it's been idle this long (10 min).
 const SHOW_WINDOW: i64 = 600;
+/// How far the transcript must advance past a "waiting" hook before we treat the
+/// approval as granted and the turn resumed. Small: the triggering tool_use is
+/// written before the hook, so any genuinely *newer* record means work moved on.
+const RESUMED_MARGIN: i64 = 2;
+/// How long after the prompt a metadata-only file touch counts as "the user
+/// opened/engaged with this conversation" (so the pet stops nagging). Larger
+/// than RESUMED_MARGIN to skip the title/mode writes that cluster around the
+/// triggering tool call itself.
+const ENGAGED_MARGIN: i64 = 4;
+// NB: there is intentionally no fixed "waiting timeout". Waiting clears only
+// when the user actually engages (opens the conversation) or work resumes, so a
+// genuine approval prompt keeps showing while you're away and you never miss it.
+// The HOOK_FRESH staleness window is the sole, far-off ceiling.
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -113,7 +126,15 @@ pub fn compute(
             let prev_status = prev.get(&s.session_id).cloned().unwrap_or(TaskStatus::Idle);
             let ack_ts = acked.get(&s.session_id).copied().unwrap_or(0);
 
-            let status = compute_session(running, jsonl_age, hook, &prev_status, ack_ts);
+            let status = compute_session(
+                running,
+                now,
+                modified_ts,
+                activity_ts,
+                hook,
+                &prev_status,
+                ack_ts,
+            );
 
             (
                 SessionState {
@@ -154,11 +175,14 @@ pub fn compute(
 
 fn compute_session(
     running: bool,
-    jsonl_age: i64,
+    now: i64,
+    modified_ts: i64,
+    activity_ts: i64,
     hook: Option<&HookStatus>,
     prev: &TaskStatus,
     ack_ts: i64,
 ) -> TaskStatus {
+    let jsonl_age = if activity_ts == 0 { i64::MAX } else { now - activity_ts };
     match hook.and_then(hook_status) {
         // RUNNING from UserPromptSubmit until a terminal event. We deliberately
         // do NOT decay on transcript quiet: a long "thinking" gap or a
@@ -168,7 +192,26 @@ fn compute_session(
         Some(TaskStatus::Running) => TaskStatus::Running,
         // Authoritative approval wait (PermissionRequest / Notification). No
         // more guessing from a pending tool call, which mislabels slow tools.
-        Some(TaskStatus::Waiting) => TaskStatus::Waiting,
+        Some(TaskStatus::Waiting) => {
+            let hook_ts = hook.map(|h| h.ts).unwrap_or(0);
+            // Self-heal #1 (work resumed): a *conversational* record landed after
+            // the prompt → approved and the turn moved on. The triggering
+            // tool_use is written before the hook, so genuine waiting has
+            // activity_ts <= hook_ts; a newer record crosses it.
+            if activity_ts > hook_ts + RESUMED_MARGIN {
+                TaskStatus::Running
+            }
+            // Self-heal #2 (user engaged): the conversation file was touched
+            // after the prompt — opening/viewing a session writes metadata
+            // (mode/title) even with no new message. Since you must be looking at
+            // the conversation to approve, this also covers the approval itself.
+            // While you're away and haven't looked, it keeps showing waiting.
+            else if modified_ts > hook_ts + ENGAGED_MARGIN {
+                TaskStatus::Running
+            } else {
+                TaskStatus::Waiting
+            }
+        }
         Some(TaskStatus::Error) => TaskStatus::Error,
         Some(TaskStatus::Completed) => {
             let hook_ts = hook.map(|h| h.ts).unwrap_or(0);
@@ -416,6 +459,60 @@ mod tests {
             &HashMap::new(),
         );
         assert_eq!(s.status, TaskStatus::Waiting);
+    }
+
+    #[test]
+    fn waiting_persists_while_untouched() {
+        // No fixed timeout: an unapproved prompt the user hasn't looked at keeps
+        // showing waiting (so they don't miss it while away), even minutes later.
+        let prompt = unix_now() - 300;
+        let mut sessions = one_session();
+        age_activity(&mut sessions, prompt); // never touched since the prompt
+        let s = compute(
+            true,
+            &sessions,
+            &hook("PermissionRequest", prompt),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(s.status, TaskStatus::Waiting);
+    }
+
+    #[test]
+    fn waiting_clears_when_user_opens_conversation() {
+        // The prompt fired 10s ago; no new message, but the conversation file
+        // was just touched (the user opened/viewed the session that needs
+        // approval) → they're handling it, so stop showing waiting.
+        let prompt = unix_now() - 10;
+        let mut sessions = one_session();
+        sessions[0].activity = at(prompt); // no new conversational record
+        sessions[0].modified = at(unix_now() - 1); // but file touched (viewed)
+        let s = compute(
+            true,
+            &sessions,
+            &hook("PermissionRequest", prompt),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(s.status, TaskStatus::Running);
+    }
+
+    #[test]
+    fn waiting_self_heals_when_work_resumes() {
+        // PermissionRequest fired earlier; the transcript has since advanced
+        // (approval granted, tool ran) → it must leave waiting even if no
+        // follow-up hook overwrote the file.
+        let approved_at = unix_now() - 30;
+        let mut sessions = one_session();
+        age_activity(&mut sessions, unix_now() - 2); // newer than the hook
+        let s = compute(
+            true,
+            &sessions,
+            &hook("PermissionRequest", approved_at),
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert_eq!(s.status, TaskStatus::Running);
     }
 
     #[test]

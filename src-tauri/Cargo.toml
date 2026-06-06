@@ -1,6 +1,6 @@
 [package]
 name = "claude-pet"
-version = "0.1.1"
+version = "0.1.2"
 description = "A pixel desktop pet that shows Claude Code's live status"
 authors = ["Claude Pet"]
 edition = "2021"

@@ -46,8 +46,11 @@ Clicking a card also brings the Claude app or terminal to the front.
 
 ### Menubar tray
 
-The app shows a tray icon (menubar). The menu shows live status and offers
-**Show/Hide Pet**, **Always on Top**, **Launch at Login**, and **Quit**.
+The app shows a **monochrome template icon** in the menu bar (auto black/white to
+match light/dark). The menu shows live status and offers **Show/Hide Pet**,
+**Always on Top**, **Launch at Login**, **Hide Dock Icon**, and **Quit**.
+*Hide Dock Icon* switches the app to a menu-bar-only (accessory) app and is
+remembered across launches.
 
 ### Diagnostics
 
@@ -92,12 +95,18 @@ build) runs silently. Two supporting signals:
   metadata writes) is a liveness **fallback** used only when a session has no
   hook (hooks not installed yet).
 
-> **Note on `waiting` and the desktop app:** "waiting for approval" relies on
+**Leaving `waiting`:** there is no "approval granted" hook and an approved
+long-running tool stays silent, so `waiting` clears when either (a) the
+transcript advances (work resumed), or (b) the session's file is touched —
+i.e. you **opened the conversation** that needs approval (which you must do to
+approve it). While you're away and haven't looked, it keeps showing `waiting`
+so you don't miss it; there is no fixed timeout.
+
+> **Note on `waiting` and the desktop app:** the prompt itself relies on
 > `PermissionRequest` / `Notification`. Terminal Claude Code emits these; some
 > desktop-app builds may not, in which case a real permission prompt shows as
-> `running` rather than `waiting`. This is deliberate — the previous
-> pending-tool-use heuristic was removed because it mislabelled long-running
-> tools as "waiting".
+> `running` rather than `waiting`. The previous pending-tool-use heuristic was
+> removed because it mislabelled long-running tools as "waiting".
 
 ---
 
