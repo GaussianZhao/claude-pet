@@ -1,0 +1,202 @@
+.app {
+  position: relative;
+  width: 100%;
+  height: 100vh;
+  background: transparent;
+  overflow: hidden;
+}
+
+/* Pet pinned to the bottom of the window. Its canvas (180px) is taller than
+   BASE_H, so its transparent top overflows upward *behind* the panel. */
+.pet-anchor {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  height: 150px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  z-index: 1;
+}
+
+.pet-host {
+  width: 150px;
+  height: 150px;
+  cursor: grab;
+}
+.pet-host:active {
+  cursor: grabbing;
+}
+
+/* ---- Card panel (above the pet) ---- */
+.panel-wrap {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  /* Above the pet so the pet's transparent canvas-top can't intercept card
+     clicks where they overlap. Height is content-driven (measured in App.tsx). */
+  z-index: 2;
+}
+
+.panel {
+  /* Fixed width + centered so its measured height doesn't depend on the
+     window-width animation when opening. Must be <= OPEN_W in App.tsx. */
+  width: 264px;
+  max-width: 100%;
+  margin: 0 auto;
+  max-height: 340px;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 8px 6px;
+  box-sizing: border-box;
+  border-radius: 14px;
+  background: rgba(30, 27, 46, 0.92);
+  color: #ede9fe;
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  /* No outer drop shadow — it falls on the transparent desktop and looks
+     unnatural. Just a thin inset border for definition. */
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.35);
+  cursor: default;
+  animation: pop 0.14s ease-out;
+}
+@keyframes pop {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+}
+
+.panel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  padding: 2px 4px 8px;
+  flex: none;
+}
+.panel-title {
+  font-weight: 700;
+  font-size: 12px;
+  color: #c4b5fd;
+  letter-spacing: 0.2px;
+}
+.panel-count {
+  font-size: 10px;
+  color: #8b80b0;
+}
+
+.cards {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 2px;
+}
+.cards::-webkit-scrollbar {
+  width: 6px;
+}
+.cards::-webkit-scrollbar-thumb {
+  background: rgba(139, 92, 246, 0.5);
+  border-radius: 3px;
+}
+
+.empty {
+  color: #8b80b0;
+  font-size: 11px;
+  text-align: center;
+  padding: 18px 0;
+}
+
+/* One task = one horizontal strip card. */
+.card {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  border-radius: 10px;
+  background: rgba(139, 92, 246, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(139, 92, 246, 0.22);
+  overflow: hidden;
+  transition: background 0.12s;
+  font: inherit;
+  color: inherit;
+}
+.card:hover {
+  background: rgba(139, 92, 246, 0.22);
+}
+
+.card-bar {
+  width: 4px;
+  flex: none;
+  background: var(--accent);
+}
+
+.card-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 8px 10px 8px 7px;
+  line-height: 1.2;
+}
+
+.card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.card-project {
+  font-size: 12px;
+  font-weight: 600;
+  color: #f5f3ff;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-badge {
+  flex: none;
+  font-size: 9px;
+  font-weight: 700;
+  color: #fff;
+  padding: 1px 6px;
+  border-radius: 999px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+.card-task {
+  font-size: 11px;
+  color: #cabfe8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.card-time {
+  font-size: 9.5px;
+  color: #7c7299;
+  line-height: 1;
+}
+
+/* A finished task gently pulses to invite a click (acknowledge). */
+.card.status-completed {
+  animation: glow 1.6s ease-in-out infinite;
+}
+@keyframes glow {
+  0%,
+  100% {
+    box-shadow: inset 0 0 0 1px rgba(236, 72, 153, 0.35);
+  }
+  50% {
+    box-shadow: inset 0 0 0 1px rgba(236, 72, 153, 0.9);
+  }
+}
