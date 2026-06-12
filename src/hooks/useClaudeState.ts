@@ -51,6 +51,11 @@ function startMock(set: (s: PetState) => void) {
     { sessionId: "c", project: "data-intake-manager", taskName: "Refactor pipeline retries", status: "completed", cwd: "/z", updatedAt: now() },
     { sessionId: "d", project: "ai-coding-pet", taskName: "npm run build failed", status: "error", cwd: "/w", updatedAt: now() },
   ] as const;
+  const usage = {
+    fiveHour: { usedPercent: 22, resetsAt: Math.floor(Date.now() / 1000) + 3 * 3600 },
+    sevenDay: { usedPercent: 48, resetsAt: Math.floor(Date.now() / 1000) + 26 * 3600 },
+    status: "allowed",
+  };
   let n = 4;
   // Expose a global so the puppeteer screenshot script can inject a specific
   // state and stop the auto-cycle so it doesn't override the injected state.
@@ -66,7 +71,7 @@ function startMock(set: (s: PetState) => void) {
       (acc, s) => (order[s.status] > order[acc] ? s.status : acc),
       "idle",
     );
-    set({ running: true, status, sessions: visible });
+    set({ running: true, status, sessions: visible, usage });
     n = n === 1 ? 4 : n - 1;
   };
   tick();

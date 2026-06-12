@@ -81,6 +81,9 @@ pub struct PetState {
     pub status: TaskStatus,
     /// One entry per active task, highest-priority first.
     pub sessions: Vec<SessionState>,
+    /// Latest plan-usage windows (5-hour + weekly), or `None` until first fetch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<crate::usage::Usage>,
 }
 
 impl Default for PetState {
@@ -89,6 +92,7 @@ impl Default for PetState {
             running: false,
             status: TaskStatus::Idle,
             sessions: Vec::new(),
+            usage: None,
         }
     }
 }
@@ -170,6 +174,7 @@ pub fn compute(
         running,
         status: pet_status,
         sessions: cards.into_iter().map(|(c, _)| c).collect(),
+        usage: None,
     }
 }
 

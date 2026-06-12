@@ -5,6 +5,7 @@
 //! native macOS notifications when a task starts waiting or finishes.
 
 mod monitor;
+mod usage;
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -88,6 +89,10 @@ struct AppState {
     /// Set while we move the window ourselves, so the Moved handler ignores it
     /// (only genuine user drags should update the anchor).
     suppress_move: AtomicBool,
+    /// Latest plan-usage windows, refreshed on a slow background poll.
+    usage: Mutex<Option<usage::Usage>>,
+    /// True while a usage fetch is in flight (dedupes poll + panel-open refresh).
+    usage_fetching: AtomicBool,
     tray: Mutex<Tray>,
 }
 
@@ -164,17 +169,20 @@ struct Layout {
     pet_bottom: f64,
     panel_left: f64,
     panel_top: f64,
+    /// Which side of the pet the panel sits on ("left" | "right") — drives the
+    /// flyout animation direction.
+    panel_side: String,
 }
 
 /// Lays out the window so the PET keeps a fixed position on screen and only the
 /// CARD moves to stay on-monitor.
 ///
-/// The pet's bottom-center (`anchor`) never changes. When the card is open we
-/// place it centered above the pet, then clamp that rectangle onto the current
-/// monitor; the window becomes the bounding box of (pet ∪ card) and the webview
-/// positions each piece via the returned offsets. So at an edge or corner the
-/// pet stays exactly where it is and the card slides over just enough to be
-/// fully visible. When closed the window is just the pet's footprint.
+/// The pet's bottom-center (`anchor`) never changes. When open, a single panel
+/// (running tasks stacked over plan usage) sits entirely to one side of the pet
+/// — the side with more room — vertically centered on it and clamped onto the
+/// monitor. The window becomes the bounding box of (pet ∪ panel) and the webview
+/// positions each piece via the returned offsets, so at an edge the pet stays
+/// put and the panel slides to stay fully visible. Closed = just the pet.
 #[tauri::command]
 fn resize_window(
     window: tauri::WebviewWindow,
@@ -218,44 +226,69 @@ fn resize_window(
     let pet_right = ax + closed_w / 2.0;
     let pet_bottom = ay;
 
-    let (win_left, win_top, win_w, win_h, layout) = if open {
-        // Card centered directly above the pet...
-        let ideal_left = ax - open_w / 2.0;
-        let ideal_top = ay - base_h - panel_h;
-        // ...then nudged onto the current monitor so it never spills off-screen.
-        let (mut pl, mut pt) = (ideal_left, ideal_top);
-        if let Ok(Some(m)) = window.current_monitor() {
+    // Current monitor bounds (x, y, w, h), if we can read them — used to keep
+    // every piece on-screen.
+    let monitor = window
+        .current_monitor()
+        .ok()
+        .flatten()
+        .map(|m| {
             let mp = m.position().to_logical::<f64>(scale);
             let ms = m.size().to_logical::<f64>(scale);
-            let max_x = mp.x + ms.width - open_w;
-            let max_y = mp.y + ms.height - panel_h;
-            if max_x >= mp.x {
-                pl = pl.clamp(mp.x, max_x);
+            (mp.x, mp.y, ms.width, ms.height)
+        });
+
+    let (win_left, win_top, win_w, win_h, layout) = if open {
+        // The panel sits entirely to one side of the pet — the side with more
+        // room: right when the pet is on the monitor's left half, else left —
+        // flipping if it would overflow, then clamped onto the monitor.
+        const GAP: f64 = 8.0;
+        let prefer_right = match monitor {
+            Some((mx, _, mw, _)) => ax < mx + mw / 2.0,
+            None => true,
+        };
+        let right_l = pet_right + GAP;
+        let left_l = pet_left - GAP - open_w;
+        let mut right = prefer_right;
+        if let Some((mx, _, mw, _)) = monitor {
+            if right && right_l + open_w > mx + mw {
+                right = false;
             }
-            if max_y >= mp.y {
-                pt = pt.clamp(mp.y, max_y);
+            if !right && left_l < mx {
+                right = true;
+            }
+        }
+        let mut pl = if right { right_l } else { left_l };
+        // Bottom-aligned with the pet, lifted a touch so the panel's lower edge
+        // clears the pet's feet and leaves a little transparent gap below it.
+        const BOTTOM_LIFT: f64 = 30.0;
+        let mut pt = pet_bottom - panel_h - BOTTOM_LIFT;
+        if let Some((mx, my, mw, mh)) = monitor {
+            if mw - open_w >= 0.0 {
+                pl = pl.clamp(mx, mx + mw - open_w);
+            }
+            if mh - panel_h >= 0.0 {
+                pt = pt.clamp(my, my + mh - panel_h);
             }
         }
 
-        // Window = bounding box of the pet footprint and the (clamped) card.
+        // The window is the bounding box of pet ∪ panel; each piece is then
+        // positioned inside it via the returned offsets.
         let win_left = pet_left.min(pl);
         let win_top = pet_top.min(pt);
         let win_right = pet_right.max(pl + open_w);
         let win_bottom = pet_bottom.max(pt + panel_h);
+        let win_w = win_right - win_left;
+        let win_h = win_bottom - win_top;
 
         let layout = Layout {
             pet_left: pet_left - win_left,
-            pet_bottom: win_bottom - pet_bottom,
+            pet_bottom: win_bottom - pet_bottom, // distance from window bottom
             panel_left: pl - win_left,
             panel_top: pt - win_top,
+            panel_side: if right { "right" } else { "left" }.to_string(),
         };
-        (
-            win_left,
-            win_top,
-            win_right - win_left,
-            win_bottom - win_top,
-            layout,
-        )
+        (win_left, win_top, win_w, win_h, layout)
     } else {
         (
             pet_left,
@@ -267,6 +300,7 @@ fn resize_window(
                 pet_bottom: 0.0,
                 panel_left: 0.0,
                 panel_top: 0.0,
+                panel_side: "right".to_string(),
             },
         )
     };
@@ -354,6 +388,8 @@ fn spawn_monitor(app: tauri::AppHandle) {
 
             let mut next = monitor::compute(running, &sessions, &hooks, &acked, &prev_map);
             stamp_since(&state, &mut next, &hooks);
+            // Fold in the latest plan-usage snapshot (refreshed by its own poller).
+            next.usage = state.usage.lock().unwrap().clone();
 
             let mut last = state.last.lock().unwrap();
             if *last != next {
@@ -370,6 +406,49 @@ fn spawn_monitor(app: tauri::AppHandle) {
             thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+/// Kicks off a one-shot plan-usage fetch on a background thread (the fetch does
+/// network + a subprocess, so we never block the caller). An in-flight guard
+/// dedupes overlapping triggers — the poller and a panel-open refresh that land
+/// together do a single request. The 1-second monitor loop folds the result
+/// into `PetState` and emits on change.
+fn trigger_usage_refresh(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    if app
+        .state::<AppState>()
+        .usage_fetching
+        .swap(true, Ordering::SeqCst)
+    {
+        return; // a fetch is already running
+    }
+    thread::spawn(move || {
+        let fetched = usage::fetch();
+        let state = app.state::<AppState>();
+        if fetched.is_some() {
+            *state.usage.lock().unwrap() = fetched;
+        }
+        state.usage_fetching.store(false, Ordering::SeqCst);
+    });
+}
+
+/// Refreshes plan usage on a slow cadence (it changes gradually and each fetch
+/// is a real `max_tokens:1` API call, so we keep it infrequent). The webview
+/// also calls `refresh_usage` whenever the panel opens, for an up-to-date read.
+fn spawn_usage_poller(app: tauri::AppHandle) {
+    /// Refresh interval (seconds). 5 minutes ≈ 288 tiny requests/day.
+    const EVERY: u64 = 300;
+    thread::spawn(move || loop {
+        trigger_usage_refresh(app.clone());
+        thread::sleep(Duration::from_secs(EVERY));
+    });
+}
+
+/// Called by the webview when the user opens the panel — refresh the usage read
+/// so the bars reflect the current moment rather than the last poll.
+#[tauri::command]
+fn refresh_usage(app: tauri::AppHandle) {
+    trigger_usage_refresh(app);
 }
 
 /// Stamps each card with the time it entered its current status, so the UI can
@@ -583,6 +662,8 @@ pub fn run() {
             anchor: Mutex::new(None),
             pet_rel: Mutex::new(None),
             suppress_move: AtomicBool::new(false),
+            usage: Mutex::new(None),
+            usage_fetching: AtomicBool::new(false),
             tray: Mutex::new(Tray::default()),
         })
         .invoke_handler(tauri::generate_handler![
@@ -590,7 +671,8 @@ pub fn run() {
             acknowledge_session,
             open_session,
             set_always_on_top,
-            resize_window
+            resize_window,
+            refresh_usage
         ])
         .setup(|app| {
             // The borderless transparent pet window must be shown + raised.
@@ -626,6 +708,7 @@ pub fn run() {
             // Apply the persisted Dock-icon preference on launch.
             apply_dock_visibility(&app.handle().clone(), load_hide_dock());
             spawn_monitor(app.handle().clone());
+            spawn_usage_poller(app.handle().clone());
             Ok(())
         })
         .run(tauri::generate_context!())

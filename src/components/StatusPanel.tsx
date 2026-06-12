@@ -6,7 +6,7 @@ export function StatusPanel({ sessions }: { sessions: SessionState[] }) {
   return (
     <div className="panel" onPointerDown={(e) => e.stopPropagation()}>
       <div className="panel-head">
-        <span className="panel-title">Claude Pet</span>
+        <span className="panel-title">Running tasks</span>
         <span className="panel-count">
           {sessions.length} task{sessions.length === 1 ? "" : "s"}
         </span>

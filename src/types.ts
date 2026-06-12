@@ -15,16 +15,30 @@ export interface SessionState {
   updatedAt: string;
 }
 
+/** One plan-usage window. `usedPercent` is 0–100; `resetsAt` is unix seconds. */
+export interface UsageWindow {
+  usedPercent: number;
+  resetsAt: number;
+}
+
+export interface Usage {
+  fiveHour: UsageWindow | null;
+  sevenDay: UsageWindow | null;
+  status: string;
+}
+
 export interface PetState {
   running: boolean;
   status: TaskStatus;
   sessions: SessionState[];
+  usage?: Usage | null;
 }
 
 export const EMPTY_PET: PetState = {
   running: false,
   status: "idle",
   sessions: [],
+  usage: null,
 };
 
 /** Per-status accent color used across the pet + cards. */
