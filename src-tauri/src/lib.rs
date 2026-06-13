@@ -154,6 +154,37 @@ fn open_session(_session_id: String, _cwd: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Bundle id of the Claude desktop app — the host most agent sessions live in.
+const CLAUDE_BUNDLE_ID: &str = "com.anthropic.claudefordesktop";
+
+/// Whether the Claude desktop app is currently the frontmost (focused) app.
+///
+/// Uses `lsappinfo` (a system tool) so it works without Automation permission,
+/// matching how `open_session` surfaces the host. Returns false on any error.
+#[cfg(target_os = "macos")]
+fn frontmost_is_claude() -> bool {
+    use std::process::Command;
+    let Ok(front) = Command::new("lsappinfo").arg("front").output() else {
+        return false;
+    };
+    let asn = String::from_utf8_lossy(&front.stdout);
+    let asn = asn.trim();
+    if asn.is_empty() {
+        return false;
+    }
+    let Ok(info) = Command::new("lsappinfo")
+        .args(["info", "-only", "bundleID", asn])
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&info.stdout).contains(CLAUDE_BUNDLE_ID)
+}
+#[cfg(not(target_os = "macos"))]
+fn frontmost_is_claude() -> bool {
+    false
+}
+
 #[tauri::command]
 fn set_always_on_top(window: tauri::WebviewWindow, value: bool) -> Result<(), String> {
     window.set_always_on_top(value).map_err(|e| e.to_string())
@@ -384,6 +415,23 @@ fn spawn_monitor(app: tauri::AppHandle) {
                     .map(|s| (s.session_id.clone(), s.status.clone()))
                     .collect()
             };
+            // Bringing the Claude desktop app to the front counts as seeing the
+            // result: acknowledge every currently-completed task so the pet can
+            // leave COMPLETED without clicking each card. Only probe the
+            // frontmost app when there's actually something to acknowledge.
+            let has_completed = prev_map.values().any(|s| *s == TaskStatus::Completed);
+            if has_completed && frontmost_is_claude() {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(0);
+                let mut acked = state.acked.lock().unwrap();
+                for (id, st) in &prev_map {
+                    if *st == TaskStatus::Completed {
+                        acked.insert(id.clone(), now);
+                    }
+                }
+            }
             let acked = state.acked.lock().unwrap().clone();
 
             let mut next = monitor::compute(running, &sessions, &hooks, &acked, &prev_map);

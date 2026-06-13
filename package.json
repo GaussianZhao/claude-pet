@@ -1,6 +1,6 @@
 {
   "name": "claude-pet",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "A pixel desktop pet that shows Claude Code's live status on macOS",
   "type": "module",
   "scripts": {
