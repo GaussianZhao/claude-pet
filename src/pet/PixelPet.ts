@@ -4,9 +4,10 @@ import { STATUS_COLOR, type TaskStatus } from "../types";
 // Canvas is sized tightly around the drawing so the window — and thus the
 // clickable area — stays small and doesn't swallow desktop clicks.
 const SIZE = 150;
-const BODY = 0xede9fe;
-const OUTLINE = 0x6d28d9;
+const BODY = 0xf3eeff;
+const OUTLINE = 0x7c5cd6;
 const ACCENT = 0x8b5cf6;
+const BLUSH = 0xff9ec4; // soft pink cheeks
 
 /**
  * A self-contained procedural pixel pet rendered with PixiJS.
@@ -25,6 +26,7 @@ export class PixelPet {
   private body = new Container();
   private leftArm = new Graphics();
   private rightArm = new Graphics();
+  private feet = new Graphics();
   private bodyShape = new Graphics();
   private face = new Container();
   private leftPupil = new Graphics();
@@ -83,39 +85,50 @@ export class PixelPet {
     this.root.addChild(this.glow);
     this.root.addChild(this.body);
 
-    // Arms drawn first so they appear behind the body shape.
+    // Feet + arms drawn first so they appear behind the body shape.
+    this.feet
+      .ellipse(-15, 39, 11, 7).fill(BODY).stroke({ width: 3, color: OUTLINE })
+      .ellipse(15, 39, 11, 7).fill(BODY).stroke({ width: 3, color: OUTLINE });
+    this.body.addChild(this.feet);
+
     this.body.addChild(this.leftArm, this.rightArm);
-    this.leftArm.position.set(-32, -4);
-    this.rightArm.position.set(32, -4);
+    this.leftArm.position.set(-33, 0);
+    this.rightArm.position.set(33, 0);
     this.drawArm(this.leftArm);
     this.drawArm(this.rightArm);
 
-    // Body blob + antenna.
+    // Rounder, chibi-proportioned body blob + bouncy antenna.
     this.bodyShape
-      .roundRect(-36, -40, 72, 80, 26)
+      .roundRect(-38, -36, 76, 74, 30)
       .fill(BODY)
       .stroke({ width: 3, color: OUTLINE, alpha: 0.9 });
-    this.bodyShape.moveTo(0, -40).lineTo(0, -52).stroke({ width: 3, color: OUTLINE });
-    this.bodyShape.circle(0, -56, 4).fill(ACCENT);
+    // Soft highlight on the upper-left of the body for a glossy look.
+    this.bodyShape.ellipse(-16, -18, 12, 8).fill({ color: 0xffffff, alpha: 0.5 });
+    this.bodyShape.moveTo(0, -36).quadraticCurveTo(-6, -48, 0, -54).stroke({ width: 3, color: OUTLINE });
+    this.bodyShape.circle(0, -57, 5).fill(ACCENT).stroke({ width: 2, color: OUTLINE });
     this.body.addChild(this.bodyShape);
 
     // Face.
     this.body.addChild(this.face);
     this.cheeks.position.set(0, 0);
     this.face.addChild(this.cheeks);
-    this.buildEye(this.eyeL, this.leftPupil, -14);
-    this.buildEye(this.eyeR, this.rightPupil, 14);
+    this.buildEye(this.eyeL, this.leftPupil, -15);
+    this.buildEye(this.eyeR, this.rightPupil, 15);
     this.face.addChild(this.eyeL, this.eyeR);
+    this.mouth.position.set(0, 3);
     this.face.addChild(this.mouth);
 
     this.root.addChild(this.fx);
   }
 
   private buildEye(eye: Container, pupil: Graphics, x: number) {
-    eye.position.set(x, -6);
+    eye.position.set(x, -4);
     const white = new Graphics();
-    white.circle(0, 0, 9).fill(0xffffff).stroke({ width: 2, color: OUTLINE });
-    pupil.circle(0, 0, 4).fill(0x312e81);
+    white.circle(0, 0, 9.5).fill(0xffffff).stroke({ width: 2.5, color: OUTLINE });
+    // Glossy pupil with two catchlights — the core of the cuteness.
+    pupil.circle(0, 1, 5.6).fill(0x3b2f7a);
+    pupil.circle(-2.1, -1.6, 2.2).fill(0xffffff);
+    pupil.circle(1.8, 2.6, 1.1).fill({ color: 0xffffff, alpha: 0.8 });
     eye.addChild(white, pupil);
   }
 
@@ -148,10 +161,11 @@ export class PixelPet {
     }
   }
 
-  private setCheeks(color: number) {
+  private setCheeks(_color: number) {
+    // Always a warm pink blush — reads cuter than a status-tinted cheek.
     this.cheeks.clear();
-    this.cheeks.circle(-22, 6, 5).fill({ color, alpha: 0.45 });
-    this.cheeks.circle(22, 6, 5).fill({ color, alpha: 0.45 });
+    this.cheeks.ellipse(-25, 9, 7, 5).fill({ color: BLUSH, alpha: 0.6 });
+    this.cheeks.ellipse(25, 9, 7, 5).fill({ color: BLUSH, alpha: 0.6 });
   }
 
   /** Public entry: safe to call before init() resolves (stores until ready). */
@@ -225,12 +239,27 @@ export class PixelPet {
   }
 
   private animateRunning(t: number) {
-    // Body bounces slightly; arms hammer alternately.
+    // Body bounces slightly; arms hammer alternately on a little keyboard.
     this.body.x = 0;
     this.body.y = Math.abs(Math.sin(t * 6)) * 1.5;
     this.leftArm.rotation  =  0.5 + Math.sin(t * 16) * 0.28;
     this.rightArm.rotation = -0.5 - Math.sin(t * 16 + Math.PI) * 0.28;
     this.lookAt(0, 4);
+
+    // A small keyboard under the hands. Drawn in fx so it sits in front of
+    // the body; keycaps light up in sequence to suggest fast typing.
+    const kb = this.fx;
+    kb.roundRect(-28, 30, 56, 15, 4).fill(0xe7e1f5).stroke({ width: 2, color: OUTLINE });
+    const lit = Math.floor(t * 18) % 12;
+    for (let r = 0; r < 2; r++) {
+      for (let c = 0; c < 6; c++) {
+        const kx = -22 + c * 9;
+        const ky = 34 + r * 6;
+        const pressed = r * 6 + c === lit;
+        kb.roundRect(kx - 3.2, ky - 2 + (pressed ? 1 : 0), 6.4, 4, 1.5)
+          .fill(pressed ? ACCENT : 0xffffff);
+      }
+    }
   }
 
   private animateWaiting(t: number) {
