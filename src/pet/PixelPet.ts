@@ -104,8 +104,8 @@ export class PixelPet {
       .stroke({ width: 3, color: OUTLINE, alpha: 0.9 });
     // Soft highlight on the upper-left of the body for a glossy look.
     this.bodyShape.ellipse(-16, -18, 12, 8).fill({ color: 0xffffff, alpha: 0.5 });
-    this.bodyShape.moveTo(0, -36).quadraticCurveTo(-6, -48, 0, -54).stroke({ width: 3, color: OUTLINE });
-    this.bodyShape.circle(0, -57, 5).fill(ACCENT).stroke({ width: 2, color: OUTLINE });
+    this.bodyShape.moveTo(0, -36).quadraticCurveTo(-5, -45, 0, -49).stroke({ width: 3, color: OUTLINE });
+    this.bodyShape.circle(0, -51, 4).fill(ACCENT).stroke({ width: 2, color: OUTLINE });
     this.body.addChild(this.bodyShape);
 
     // Face.
@@ -126,9 +126,9 @@ export class PixelPet {
     const white = new Graphics();
     white.circle(0, 0, 9.5).fill(0xffffff).stroke({ width: 2.5, color: OUTLINE });
     // Glossy pupil with two catchlights — the core of the cuteness.
-    pupil.circle(0, 1, 5.6).fill(0x3b2f7a);
-    pupil.circle(-2.1, -1.6, 2.2).fill(0xffffff);
-    pupil.circle(1.8, 2.6, 1.1).fill({ color: 0xffffff, alpha: 0.8 });
+    pupil.circle(0, 1, 4.7).fill(0x3b2f7a);
+    pupil.circle(-1.8, -1.3, 1.9).fill(0xffffff);
+    pupil.circle(1.5, 2.2, 0.9).fill({ color: 0xffffff, alpha: 0.8 });
     eye.addChild(white, pupil);
   }
 
@@ -250,7 +250,10 @@ export class PixelPet {
     // the body; keycaps light up in sequence to suggest fast typing.
     const kb = this.fx;
     kb.roundRect(-28, 30, 56, 15, 4).fill(0xe7e1f5).stroke({ width: 2, color: OUTLINE });
-    const lit = Math.floor(t * 18) % 12;
+    // Pick a pseudo-random key each typing beat; stays fixed within the beat so
+    // it reads as keystrokes rather than per-frame flicker.
+    const step = Math.floor(t * 16);
+    const lit = Math.floor(fract(Math.sin(step * 127.1) * 43758.5453) * 12);
     for (let r = 0; r < 2; r++) {
       for (let c = 0; c < 6; c++) {
         const kx = -22 + c * 9;
@@ -324,3 +327,4 @@ export class PixelPet {
 }
 
 function lerp(a: number, b: number, t: number) { return a + (b - a) * t; }
+function fract(x: number) { return x - Math.floor(x); }
