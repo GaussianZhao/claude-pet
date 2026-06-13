@@ -44,11 +44,11 @@ function barColor(pct: number): string {
   return "#6366f1";
 }
 
-/** Compact "resets in" label: 1d / 3h / 12m, like the /usage panel. */
+/** "resets in" label carried to the next-finer unit: 1d 3h / 3h 12m / 12m 30s. */
 function resetsIn(unixSec: number): string {
-  const s = Math.max(0, unixSec - Date.now() / 1000);
-  if (s >= 86400) return `${Math.round(s / 86400)}d`;
-  if (s >= 3600) return `${Math.round(s / 3600)}h`;
-  if (s >= 60) return `${Math.round(s / 60)}m`;
-  return "<1m";
+  const s = Math.max(0, Math.floor(unixSec - Date.now() / 1000));
+  if (s >= 86400) return `${Math.floor(s / 86400)}d ${Math.floor((s % 86400) / 3600)}h`;
+  if (s >= 3600) return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+  if (s >= 60) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${s}s`;
 }
